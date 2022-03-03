@@ -3,6 +3,7 @@ from pygame import midi
 import time
 import pulsectl
 #note: could try pulsectl_asyncio
+from pyudev import Context, Monitor
 
 """
 this code is for a custom midi device that my brother made
@@ -15,23 +16,34 @@ references I used to make this code:
 https://stackoverflow.com/questions/1554896/getting-input-from-midi-devices-live-python
 https://www.pygame.org/docs/ref/midi.html
 https://pypi.org/project/pulsectl/
+https://stackoverflow.com/questions/51007632/how-to-monitor-usb-devices-insertion#51011386
+
 """
 
 RAISE_MAX_VOLUME = False
+IGNORE_SORCE_MONITORS = True
 VERBOSE = False
 
 class MidiMixer:
   def __init__(self, midi_device_name="QT Py M0 MIDI 1", num_channels=5):
-    self.num_channels = num_channels
     self.midi_device_name = midi_device_name
-    self.connect()
+    self.num_channels = num_channels
 
-  def connect(self):
+    context = Context()
+    self.monitor = Monitor.from_netlink(context)
+    self.monitor.filter_by(subsystem='usb', device_type='usb_device')
+
+    self.wait_for_midi_device()
+
+  def find_midi_device(self):
     self.input_device = None
     self.output_device = None
     self.buttons = [False] * self.num_channels
     self.sliders = [None] * self.num_channels
     self.leds = [None] * self.num_channels
+
+    midi.quit()
+    midi.init()
     all_midi_device_names = set()
     for id in range(midi.get_count()):
       interf, name, is_input, is_output, is_opened = midi.get_device_info(id)
@@ -39,17 +51,27 @@ class MidiMixer:
       all_midi_device_names.add(name)
       if name == self.midi_device_name:
         if is_input == 1:
-          print("input id {} found for {}".format(id, name))
+          print("input id {} found for '{}'".format(id, name))
           self.input_device = midi.Input(id)
         if is_output == 1:
-          print("output id {} found for {}".format(id, name))
+          print("output id {} found for '{}'".format(id, name))
           self.output_device = midi.Output(id)
-    print(all_midi_device_names)
-    if self.input_device is None or self.output_device is None:
-      raise Exception("MIDI device '{}' not found! Device list:\n".format(self.midi_device_name) + "\n".join(all_midi_device_names))
+    print("all midi devices:", all_midi_device_names)
+    return not (self.input_device is None or self.output_device is None)
 
-  def set_led(self, channel, value=True):
-    if self.leds[channel] != value:
+  def wait_for_midi_device(self):
+    # midi.quit()
+    while not self.find_midi_device():
+      device = None
+      while device is None:
+        device = self.monitor.poll(timeout=1)
+        if device is not None and device.properties["ACTION"] != "add":
+          device = None
+      print("usb device plugged in, trying to connect...")
+      # midi.quit()
+
+  def set_led(self, channel, value=True, force=False):
+    if self.leds[channel] != value or force:
       if VERBOSE: print("led {} => {}".format(channel, value))
       self.leds[channel] = value
       try:
@@ -58,17 +80,22 @@ class MidiMixer:
         else:
           self.output_device.note_off(channel+1)
       except Exception as e:
-        print(dir(e))
-        if e.args[0] == b"PortMidi: `Host error'":
-          print("device unplugged, trying to reconnect")
+        if e.args[0] == b"PortMidi: `Host error'": #only resolve a midi connection error
+          print("device unplugged, waiting for reconnect...")
           self.input_device.close()
           self.output_device.close()
-          midi.quit()
-          time.sleep(0.25)
-          midi.init()
-          self.connect()
+          self.wait_for_midi_device()
         else:
           raise e
+
+  def check_for_unplug(self):
+    device = self.monitor.poll(timeout=0) #non-blocking
+    if device is not None and device.properties["ACTION"] == "remove":
+      print("usb device unplugged, checking if mixer still plugged in")
+      #force setting an LED to the same value to test if still connected
+      self.set_led(0, self.leds[0], force=True)
+      return True
+    return False
 
   def poll(self, read_amount=10):
     events = []
@@ -97,15 +124,24 @@ class VolumeController:
     self.name = name
     self.connect()
 
-  def connect(self):
-    self.pulse = pulsectl.Pulse(self.name)
-    
-    #possible event masks:
-    #null sink source sink-input source-output module client sample-cache server autoload card all
-    self.pulse.event_mask_set("sink", "source", "sink-input")
-    # self.pulse.event_mask_set("all")
-    self.pulse.event_callback_set(self.pulse_callback)
-    self.pending_event = True
+  def connect(self, tries=5):
+    for i in range(tries):
+      try:
+        self.pulse = pulsectl.Pulse(self.name) #this may fail
+        
+        #possible event masks:
+        #null sink source sink-input source-output module client sample-cache server autoload card all
+        self.pulse.event_mask_set("sink", "source", "sink-input")
+        # self.pulse.event_mask_set("all")
+        self.pulse.event_callback_set(self.pulse_callback)
+        self.pending_event = True
+        print("successfully connected to pulse")
+        return
+      except pulsectl.pulsectl.PulseError as e:
+        print("error connecting to pulse, retrying...")
+        time.sleep(0.1)
+        if i == tries-1:
+          raise e
 
   def pulse_callback(self, event):
     # if VERBOSE: print(event)
@@ -123,7 +159,14 @@ class VolumeController:
 
   def refresh_volume_controls(self):
     try:
-      self.volume_controls = self.pulse.sink_list() + [x for x in self.pulse.source_list() if not "monitorTODO" in x.name] + self.pulse.sink_input_list()
+      sink_list = self.pulse.sink_list()
+      source_list = self.pulse.source_list()
+      sink_input_list = self.pulse.sink_input_list()
+
+      if IGNORE_SORCE_MONITORS:
+        source_list = [x for x in source_list if not "monitor" in x.name]
+
+      self.volume_controls = sink_list + source_list + sink_input_list
     except pulsectl.pulsectl.PulseOperationFailed as e:
       print(e)
 
@@ -132,6 +175,7 @@ class VolumeController:
       try:
         self.pulse.volume_set_all_chans(self.volume_controls[channel], value)
       except pulsectl.pulsectl.PulseOperationFailed as e:
+      # time.sleep(1) #TODO retry instead of sleeping before 1st try
         print(e)
       if VERBOSE: print("channel {} volume set to {}".format(channel, value))
     else:
@@ -140,7 +184,7 @@ class VolumeController:
   def toggle_mute(self, channel):
     if channel < len(self.volume_controls):
       volume_control = self.volume_controls[channel]
-      print(volume_control) #TODO
+      if VERBOSE: print("toggle mute for:", volume_control)
       try:
         self.pulse.mute(volume_control, not volume_control.mute)
       except pulsectl.pulsectl.PulseOperationFailed as e:
@@ -161,7 +205,6 @@ class VolumeController:
 
 
 
-midi.init()
 mixer = MidiMixer()
 volctl = VolumeController()
 
@@ -169,7 +212,7 @@ while True:
   events = []
   while not events:
     events = mixer.poll()
-    if volctl.wait_and_listen(0.01):
+    if volctl.wait_and_listen(0.01) or mixer.check_for_unplug():
       if VERBOSE: print("event detected, refreshing LEDs")
       for channel in range(mixer.num_channels):
         is_muted = volctl.is_muted(channel)

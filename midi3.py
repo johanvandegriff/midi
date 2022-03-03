@@ -1,8 +1,5 @@
 #!/usr/bin/env python
-# import pygame
 from pygame import midi
-import time
-import os
 import pulsectl
 #note: could try pulsectl_asyncio
 
@@ -19,139 +16,142 @@ https://www.pygame.org/docs/ref/midi.html
 https://pypi.org/project/pulsectl/
 """
 
-device_name = "QT Py M0 MIDI 1"
-verbose = True
+RAISE_MAX_VOLUME = False
+VERBOSE = True
+
+class MidiMixer:
+  def __init__(self, midi_device_name="QT Py M0 MIDI 1", num_channels=5):
+    self.num_channels = num_channels
+    self.midi_device_name = midi_device_name
+    self.input_device = None
+    self.output_device = None
+    self.buttons = [False] * self.num_channels
+    self.sliders = [None] * self.num_channels
+    self.leds = [None] * self.num_channels
+    all_midi_device_names = set()
+    for id in range(midi.get_count()):
+      interf, name, is_input, is_output, is_opened = midi.get_device_info(id)
+      name = name.decode("utf-8")
+      all_midi_device_names.add(name)
+      if name == midi_device_name:
+        if is_input == 1:
+          print("found input device for " + name)
+          input_id = id
+          self.input_device = midi.Input(input_id)
+        if is_output == 1:
+          print("found output device for " + name)
+          output_id = id
+          self.output_device = midi.Output(output_id)
+    if self.input_device is None or self.output_device is None:
+      raise Exception("MIDI device '{}' not found! Device list:\n".format(midi_device_name) + "\n".join(all_midi_device_names))
+
+  def set_led(self, channel, value=True):
+    if self.leds[channel] != value:
+      if VERBOSE: print("led {} => {}".format(channel, value))
+      self.leds[channel] = value
+      if value:
+        self.output_device.note_on(channel+1, 100)
+      else:
+        self.output_device.note_off(channel+1)
+
+  def poll(self, read_amount=10):
+    events = []
+    if self.input_device.poll():
+      sliders_old = self.sliders[:]
+      buttons_old = self.buttons[:]
+      for data in self.input_device.read(read_amount):
+        # if VERBOSE: print(data[0])
+        button_or_slider, channel, value, _ = data[0]
+        if button_or_slider == 176: #slider value
+          self.sliders[channel] = value
+        elif button_or_slider == 144: #button pressed
+          self.buttons[channel] = True
+        elif button_or_slider == 128: #button released
+          self.buttons[channel] = False
+      for channel in range(self.num_channels):
+        if sliders_old[channel] != self.sliders[channel]:
+          events.append(["slider", channel, self.sliders[channel]])
+        if buttons_old[channel] != self.buttons[channel]:
+          events.append(["button", channel, self.buttons[channel]])
+    return events
+
+
+class VolumeController:
+  def __init__(self, name="volume-controller"): #client name can be whatever
+    self.name = name
+    self.pulse = pulsectl.Pulse(self.name)
+    
+    #possible event masks:
+    #null sink source sink-input source-output module client sample-cache server autoload card all
+    self.pulse.event_mask_set("sink", "source", "sink-input")
+    # self.pulse.event_mask_set("all")
+    self.pulse.event_callback_set(self.pulse_callback)
+    self.pending_event = True
+
+  def pulse_callback(self, event):
+    # if VERBOSE: print(event)
+    self.pending_event = True
+
+  def wait_and_listen(self, timeout):
+    self.pulse.event_listen(timeout=timeout)
+    result = self.pending_event
+    self.pending_event = False
+    return result
+
+  def refresh_volume_controls(self):
+    self.volume_controls = self.pulse.sink_list() + [x for x in self.pulse.source_list() if not "monitor" in x.name] + self.pulse.sink_input_list()
+
+  def set_volume(self, channel, value):
+    if channel < len(self.volume_controls):
+      self.pulse.volume_set_all_chans(self.volume_controls[channel], value)
+      if VERBOSE: print("channel {} volume set to {}".format(channel, value))
+    else:
+      if VERBOSE: print("set_volume of channel {} ignored, nothing to control".format(channel))
+
+  def toggle_mute(self, channel):
+    if channel < len(self.volume_controls):
+      volume_control = self.volume_controls[channel]
+      self.pulse.mute(volume_control, not volume_control.mute)
+      if volume_control.mute:
+        if VERBOSE: print("channel {} muted (/)".format(channel))
+      else:
+        if VERBOSE: print("channel {} unmuted (o)".format(channel))
+    else:
+      if VERBOSE: print("toggle_mute channel {} ignored, nothing to control".format(channel))
+
+  def is_muted(self, channel):
+    self.refresh_volume_controls()
+    if channel < len(self.volume_controls):
+      return self.volume_controls[channel].mute
+    else:
+      return None
+
+
 
 midi.init()
-# print(midi.get_count())
-input_id = None
-output_id = None
+mixer = MidiMixer()
+volctl = VolumeController()
 
-for id in range(midi.get_count()):
-  interf, name, is_input, is_output, is_opened = midi.get_device_info(id)
-  name = name.decode("utf-8")
-  if name == device_name:
-    if is_input == 1:
-      print("found input device for " + name)
-      input_id = id
-    if is_output == 1:
-      print("found output device for " + name)
-      output_id = id
-
-#input_id = midi.get_default_input_id()
-#input_id = 5
-# print("Enter the number above corresponding to the input of the mixer device")
-# input_id = int(input())
-input_device = midi.Input(input_id)
-
-#output_id = midi.get_default_input_id()
-#output_id = 4
-# print("Enter the number above corresponding to the output of the mixer device")
-# output_id = int(input())
-output_device = midi.Output(output_id)
-
-# output_device.note_off(1)
-# output_device.note_off(2)
-# output_device.note_off(3)
-# output_device.note_off(4)
-# output_device.note_off(5)
-
-pulse = pulsectl.Pulse('my-client-name')
-
-def get_volume_controls():
-  volume_controls = pulse.sink_list() + [x for x in pulse.source_list() if not "monitor" in x.name] + pulse.sink_input_list()
-  #volume_controls = pulse.sink_input_list()
-  return volume_controls
-
-def process_data(isButton, channel, value):
-  volume_controls = get_volume_controls() #TODO move this out to avoid duplication
-  if channel >= len(volume_controls):
-    if verbose: print("event on channel {} ignored because no volume control is attached".format(channel))
-  else:
-    volume_control = volume_controls[channel]
-    if isButton:
-      if value:
-        if verbose: print("button {} pressed".format(channel))
-        #output_device.note_on(channel+1, 100)
-        pulse.mute(volume_control, not volume_control.mute)
-        update_mute_light(channel, volume_control, verbose)
-        #os.system("pactl set-sink-mute @DEFAULT_SINK@ toggle #{}".format(channel+1))
-      else:
-        if verbose: print("button {} released".format(channel))
-        #output_device.note_off(channel+1)
-    else: #isButton = false, it is a slider
-      scaled = value / 127.0
-      if verbose: print("slider {} value: {} scaled: {}".format(channel, value, scaled))
-      pulse.volume_set_all_chans(volume_control, scaled)
-      #os.system("pactl set-sink-volume @DEFAULT_SINK@ {}%".format(scaled))
-
-# Initializing Pygame
-#pygame.init()
-
-# Initializing surface
-#surface = pygame.display.set_mode((400,300))
-
-# Initialing Color
-#color = (255,0,0)
-
-# Drawing Rectangle
-#pygame.draw.rect(surface, color, pygame.Rect(30, 30, 60, 60))
-#pygame.display.flip()
-
-pending_event = False
-
-def handle_events(ev):
-  global pending_event
-  pending_event = True
-  # print(pending_event)
-  # print('Pulse event:', ev)
-
-pulse.event_mask_set('all')
-pulse.event_callback_set(handle_events)
-## pulse.event_listen(timeout=10)
-
-def update_mute_light(channel, volume_control, verbose):
-  if volume_control.mute:
-    if verbose: print("channel {} muted (/)".format(channel))
-    output_device.note_off(channel+1)
-  else:
-    if verbose: print("channel {} unmuted (o)".format(channel))
-    output_device.note_on(channel+1, 100)
-
-
-def update_mute_lights():
-  volume_controls = get_volume_controls()
-  for channel, volume_control in enumerate(volume_controls):
-    update_mute_light(channel, volume_control, False)
-  for channel in range(len(volume_controls),5):
-    output_device.note_off(channel+1)
-
-update_mute_lights()
 while True:
-  while not input_device.poll():
-    pulse.event_listen(timeout=0.05)
-    # time.sleep(0.05)
-    # update_mute_lights()
-    # print(pending_event)
-    if pending_event:
-      if verbose: print("callback returned event, refreshing LEDs")
-      #TODO ignore callback events generated from itself if possible, maybe disable and re-enable callback, maybe its ok
-      pending_event = False
-      update_mute_lights()
-  # print(input_device.read(999))
-  # print()
-  #TODO only use the last event of each type (slider, button) from each channel
-  for data in input_device.read(10):
-    if verbose: print(data[0])
-    button_or_slider, channel, value, _ = data[0]
-    if button_or_slider == 176: #slider value
-      process_data(False, channel, value)
-    elif button_or_slider == 144: #button pressed
-      process_data(True, channel, True)
-    elif button_or_slider == 128: #button released
-      process_data(True, channel, False)
-
-#[[[176, 4, 79, 0], 0]] slider 4 value: 79
-#[[[144, 3, 127, 0], 0]] button 3 pressed
-#[[[128, 3, 127, 0], 1]] button 3 released
-
+  events = []
+  while not events:
+    events = mixer.poll()
+    if volctl.wait_and_listen(0.01):
+      if VERBOSE: print("event detected, refreshing LEDs")
+      for channel in range(mixer.num_channels):
+        is_muted = volctl.is_muted(channel)
+        if is_muted is None: is_muted = True
+        mixer.set_led(channel, not is_muted)
+  
+  volctl.refresh_volume_controls()
+  for event_type, channel, value in events:
+    if event_type == "button":
+      if VERBOSE: print("button {} => {}".format(channel, value))
+      if value:
+        volctl.toggle_mute(channel)
+    elif event_type == "slider":
+      scaled = value / 127.0
+      if RAISE_MAX_VOLUME:
+        scaled = scaled * 1.5
+      if VERBOSE: print("slider {} => {} (scaled = {})".format(channel, value, scaled))
+      volctl.set_volume(channel, scaled)

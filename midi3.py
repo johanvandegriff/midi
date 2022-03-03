@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 from pygame import midi
+import time
 import pulsectl
 #note: could try pulsectl_asyncio
 
@@ -17,12 +18,15 @@ https://pypi.org/project/pulsectl/
 """
 
 RAISE_MAX_VOLUME = False
-VERBOSE = True
+VERBOSE = False
 
 class MidiMixer:
   def __init__(self, midi_device_name="QT Py M0 MIDI 1", num_channels=5):
     self.num_channels = num_channels
     self.midi_device_name = midi_device_name
+    self.connect()
+
+  def connect(self):
     self.input_device = None
     self.output_device = None
     self.buttons = [False] * self.num_channels
@@ -33,26 +37,38 @@ class MidiMixer:
       interf, name, is_input, is_output, is_opened = midi.get_device_info(id)
       name = name.decode("utf-8")
       all_midi_device_names.add(name)
-      if name == midi_device_name:
+      if name == self.midi_device_name:
         if is_input == 1:
-          print("found input device for " + name)
-          input_id = id
-          self.input_device = midi.Input(input_id)
+          print("input id {} found for {}".format(id, name))
+          self.input_device = midi.Input(id)
         if is_output == 1:
-          print("found output device for " + name)
-          output_id = id
-          self.output_device = midi.Output(output_id)
+          print("output id {} found for {}".format(id, name))
+          self.output_device = midi.Output(id)
+    print(all_midi_device_names)
     if self.input_device is None or self.output_device is None:
-      raise Exception("MIDI device '{}' not found! Device list:\n".format(midi_device_name) + "\n".join(all_midi_device_names))
+      raise Exception("MIDI device '{}' not found! Device list:\n".format(self.midi_device_name) + "\n".join(all_midi_device_names))
 
   def set_led(self, channel, value=True):
     if self.leds[channel] != value:
       if VERBOSE: print("led {} => {}".format(channel, value))
       self.leds[channel] = value
-      if value:
-        self.output_device.note_on(channel+1, 100)
-      else:
-        self.output_device.note_off(channel+1)
+      try:
+        if value:
+          self.output_device.note_on(channel+1, 100)
+        else:
+          self.output_device.note_off(channel+1)
+      except Exception as e:
+        print(dir(e))
+        if e.args[0] == b"PortMidi: `Host error'":
+          print("device unplugged, trying to reconnect")
+          self.input_device.close()
+          self.output_device.close()
+          midi.quit()
+          time.sleep(0.25)
+          midi.init()
+          self.connect()
+        else:
+          raise e
 
   def poll(self, read_amount=10):
     events = []
@@ -79,6 +95,9 @@ class MidiMixer:
 class VolumeController:
   def __init__(self, name="volume-controller"): #client name can be whatever
     self.name = name
+    self.connect()
+
+  def connect(self):
     self.pulse = pulsectl.Pulse(self.name)
     
     #possible event masks:
@@ -93,17 +112,27 @@ class VolumeController:
     self.pending_event = True
 
   def wait_and_listen(self, timeout):
-    self.pulse.event_listen(timeout=timeout)
+    try:
+      self.pulse.event_listen(timeout=timeout)
+    except pulsectl.pulsectl.PulseDisconnected as e:
+      print("pulseaudio disconnected, reconnecting")
+      self.connect()
     result = self.pending_event
     self.pending_event = False
     return result
 
   def refresh_volume_controls(self):
-    self.volume_controls = self.pulse.sink_list() + [x for x in self.pulse.source_list() if not "monitor" in x.name] + self.pulse.sink_input_list()
+    try:
+      self.volume_controls = self.pulse.sink_list() + [x for x in self.pulse.source_list() if not "monitorTODO" in x.name] + self.pulse.sink_input_list()
+    except pulsectl.pulsectl.PulseOperationFailed as e:
+      print(e)
 
   def set_volume(self, channel, value):
     if channel < len(self.volume_controls):
-      self.pulse.volume_set_all_chans(self.volume_controls[channel], value)
+      try:
+        self.pulse.volume_set_all_chans(self.volume_controls[channel], value)
+      except pulsectl.pulsectl.PulseOperationFailed as e:
+        print(e)
       if VERBOSE: print("channel {} volume set to {}".format(channel, value))
     else:
       if VERBOSE: print("set_volume of channel {} ignored, nothing to control".format(channel))
@@ -111,7 +140,11 @@ class VolumeController:
   def toggle_mute(self, channel):
     if channel < len(self.volume_controls):
       volume_control = self.volume_controls[channel]
-      self.pulse.mute(volume_control, not volume_control.mute)
+      print(volume_control) #TODO
+      try:
+        self.pulse.mute(volume_control, not volume_control.mute)
+      except pulsectl.pulsectl.PulseOperationFailed as e:
+        print(e)
       if volume_control.mute:
         if VERBOSE: print("channel {} muted (/)".format(channel))
       else:
